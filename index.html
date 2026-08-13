@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IRON LAB — Registro de Treinos</title>
+  <meta name="description"
+    content="Web app para registrar carga e repetições dos seus treinos e acompanhar sua evolução de força.">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <!-- ============================================
+     CABEÇALHO
+     ============================================ -->
+  <header class="app-header">
+    <div class="app-header-inner">
+      <button class="btn-home-nav" id="btnHome" title="Voltar para início" hidden>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 12H5M12 19l-7-7 7-7" />
+        </svg>
+      </button>
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <h1>IRON LAB</h1>
+      </div>
+    </div>
+  </header>
+
+  <main class="app-main">
+
+    <!-- ============================================
+       TELA INICIAL — IDEIA 1: READY TO CRUSH
+       ============================================ -->
+    <section class="home-view hero-flow" id="homeView">
+      <div class="welcome-banner">
+        <span class="status-badge">SEU FOCO HOJE</span>
+        <h2 class="welcome-title">Pronto para superar suas marcas?</h2>
+      </div>
+
+      <!-- CARD PRINCIPAL DE RECOMENDAÇÃO INTELIGENTE -->
+      <div class="suggested-card" id="suggestedCard">
+        <!-- Renderizado via JavaScript -->
+      </div>
+
+      <!-- SELEÇÃO RÁPIDA DE OUTROS DIAS -->
+      <div class="quick-section">
+        <h3>OU ESCOLHA OUTRO DIA</h3>
+        <div class="quick-grid" id="quickGrid">
+          <!-- Cards dos treinos A-E renderizados via JavaScript -->
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================
+       VISUALIZAÇÃO DE TREINO DETALHADO
+       ============================================ -->
+    <div class="workout-view" id="workoutView" hidden>
+      <nav class="tabs-wrap" aria-label="Dias de treino">
+        <div class="tabs" role="tablist" id="tabsList"></div>
+      </nav>
+      <div id="panels"></div>
+    </div>
+
+  </main>
+
+  <!-- ============================================
+     MODAL — GRÁFICO DE EVOLUÇÃO
+     ============================================ -->
+  <div class="modal-overlay" id="modalOverlay" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-head">
+        <div>
+          <h2 id="modalTitle">Exercício</h2>
+          <span class="modal-badge" id="modalBadge" hidden></span>
+        </div>
+        <button class="modal-close" id="modalClose" aria-label="Fechar">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <path d="M1 1L17 17M17 1L1 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-empty" id="modalEmpty" hidden>Registre pelo menos 2 treinos deste exercício pra ver sua evolução
+          aqui.</p>
+        <div class="chart-wrap" id="chartWrap">
+          <canvas id="evolutionChart" height="260"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="app-footer">
+    <p>Seus dados ficam salvos só neste navegador (localStorage).</p>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="script.js" defer></script>
+</body>
+
+</html>
