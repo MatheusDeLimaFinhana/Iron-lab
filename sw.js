@@ -1,10 +1,11 @@
-const CACHE_NAME = 'ironlab-v1';
+const CACHE_NAME = 'ironlab-v2';
 const ASSETS = [
     './',
     './index.html',
     './style.css',
     './script.js',
-    './manifest.json'
+    './manifest.json',
+    './logo.jpg'
 ];
 
 self.addEventListener('install', e => {
