@@ -38,6 +38,11 @@ const WORKOUTS = [
 
 const STORAGE_KEY = 'forge_treino_log_v1';
 const LAST_TAB_KEY = 'forge_last_tab';
+const LOCAL_MIGRATION_PREFIX = 'ironlab_cloud_migrated_';
+let cloudLog = {};
+let currentUser = null;
+let currentFriend = null;
+let authMode = 'login';
 
 let currentChart = null;
 let currentExerciseId = null;
@@ -77,38 +82,83 @@ function todayISO() {
   return local.toISOString().slice(0, 10);
 }
 
-/* ============================================
-   PERSISTÊNCIA (localStorage)
-   estrutura: { [exerciseId]: [{date, carga, reps, ts}, ...] }
-   ============================================ */
-function getLog() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch (e) {
-    console.warn('Não foi possível ler o histórico salvo:', e);
-    return {};
-  }
+let toastTimer = null;
+function showToast(message, type = 'success') {
+  const toast = document.getElementById('toast');
+  if (!toast) return;
+  toast.textContent = message;
+  toast.className = `toast show ${type}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
 }
 
-function saveLog(log) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(log));
-  } catch (e) {
-    console.warn('Não foi possível salvar o histórico:', e);
-  }
+function friendlyError(error, fallback = 'Algo deu errado. Tente novamente.') {
+  const message = error?.message || '';
+  if (/duplicate key|unique constraint/i.test(message)) return 'Esse usuário já está em uso.';
+  if (/invalid login credentials/i.test(message)) return 'E-mail ou senha incorretos.';
+  if (/email not confirmed/i.test(message)) return 'Confirme seu e-mail antes de entrar.';
+  if (/password should be at least/i.test(message)) return 'A senha precisa ter pelo menos 6 caracteres.';
+  if (/network|fetch failed|failed to fetch/i.test(message)) return 'Sem conexão com a internet. Verifique sua rede.';
+  return message || fallback;
 }
+
+/* ============================================
+   PERSISTÊNCIA — SUPABASE
+   O localStorage continua sendo usado apenas como
+   cache temporário/migração do histórico antigo.
+   ============================================ */
+function getLog() { return cloudLog || {}; }
+
+function saveLog(log) { cloudLog = log || {}; }
 
 function getEntries(exId) {
-  const log = getLog();
-  return (log[exId] || []).slice().sort((a, b) => a.ts - b.ts);
+  return (getLog()[exId] || []).slice().sort((a, b) => {
+    const ta = a.ts || new Date(a.created_at || a.date).getTime();
+    const tb = b.ts || new Date(b.created_at || b.date).getTime();
+    return ta - tb;
+  });
 }
 
-function addEntry(exId, carga, reps) {
-  const log = getLog();
-  if (!log[exId]) log[exId] = [];
-  log[exId].push({ date: todayISO(), carga, reps, ts: Date.now() });
-  saveLog(log);
+async function loadCloudLog() {
+  if (!currentUser) return;
+  const { data, error } = await supabaseClient
+    .from('workout_entries')
+    .select('id, exercise_id, exercise_name, workout_day, date, carga, reps, created_at')
+    .eq('user_id', currentUser.id)
+    .order('date', { ascending: true })
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+  cloudLog = {};
+  (data || []).forEach(row => {
+    if (!cloudLog[row.exercise_id]) cloudLog[row.exercise_id] = [];
+    cloudLog[row.exercise_id].push({
+      id: row.id,
+      date: row.date,
+      carga: Number(row.carga),
+      reps: Number(row.reps),
+      ts: new Date(row.created_at).getTime(),
+      created_at: row.created_at
+    });
+  });
+}
+
+async function addEntry(exId, carga, reps) {
+  if (!currentUser) throw new Error('Você precisa estar conectado.');
+  const day = WORKOUTS.find(d => exId.startsWith(d.id + '-'));
+  const exerciseName = day ? day.exercises.find(name => exerciseId(day.id, name) === exId) : exId;
+  const { data, error } = await supabaseClient.from('workout_entries').insert({
+    user_id: currentUser.id,
+    exercise_id: exId,
+    exercise_name: exerciseName || exId,
+    workout_day: day ? day.id : '',
+    date: todayISO(),
+    carga,
+    reps
+  }).select('id, date, carga, reps, created_at').single();
+  if (error) throw error;
+  if (!cloudLog[exId]) cloudLog[exId] = [];
+  cloudLog[exId].push({ id: data.id, date: data.date, carga: Number(data.carga), reps: Number(data.reps), ts: new Date(data.created_at).getTime(), created_at: data.created_at });
 }
 
 function getLastEntry(exId) {
@@ -116,7 +166,6 @@ function getLastEntry(exId) {
   return entries.length ? entries[entries.length - 1] : null;
 }
 
-// data do treino mais recente entre todos os exercícios de um dia
 function getDayLastTrained(day) {
   let latest = null;
   day.exercises.forEach(name => {
@@ -126,27 +175,43 @@ function getDayLastTrained(day) {
   return latest;
 }
 
-// Função para deletar um registro específico
-function deleteEntry(exId, ts) {
+async function deleteEntry(exId, id) {
   if (!confirm('Tem certeza que deseja excluir este registro?')) return;
-
-  const log = getLog();
-  if (log[exId]) {
-    // Filtra removendo o registro que tem o Timestamp exato
-    log[exId] = log[exId].filter(e => e.ts !== ts);
-    saveLog(log);
-
-    // Atualiza a tela do card
-    refreshCard(exId);
-
-    // Atualiza a meta-data do dia (último treino)
-    const card = document.querySelector(`[data-exercise-id="${exId}"]`);
-    if (card) {
-      const dayPanel = card.closest('.day-panel');
-      const day = WORKOUTS.find(d => dayPanel.dataset.dayPanel === d.id);
-      if (day) refreshDayMeta(day);
-    }
+  const { error } = await supabaseClient.from('workout_entries').delete().eq('id', id).eq('user_id', currentUser.id);
+  if (error) { showToast(friendlyError(error, 'Não foi possível excluir o registro.'), 'error'); return; }
+  if (cloudLog[exId]) cloudLog[exId] = cloudLog[exId].filter(e => String(e.id) !== String(id));
+  refreshCard(exId);
+  const card = document.querySelector(`[data-exercise-id="${exId}"]`);
+  if (card) {
+    const dayPanel = card.closest('.day-panel');
+    const day = WORKOUTS.find(d => dayPanel.dataset.dayPanel === d.id);
+    if (day) refreshDayMeta(day);
   }
+}
+
+async function migrateLocalLog() {
+  if (!currentUser) return;
+  const key = LOCAL_MIGRATION_PREFIX + currentUser.id;
+  if (localStorage.getItem(key)) return;
+  let oldLog = {};
+  try { oldLog = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch (_) {}
+  const rows = [];
+  Object.entries(oldLog).forEach(([exId, entries]) => {
+    const day = WORKOUTS.find(d => exId.startsWith(d.id + '-'));
+    const exerciseName = day ? day.exercises.find(name => exerciseId(day.id, name) === exId) : exId;
+    (entries || []).forEach(e => {
+      if (e && Number(e.carga) > 0 && Number(e.reps) > 0) rows.push({
+        user_id: currentUser.id, exercise_id: exId, exercise_name: exerciseName || exId,
+        workout_day: day ? day.id : '', date: e.date || todayISO(), carga: Number(e.carga), reps: Number(e.reps),
+        created_at: e.ts ? new Date(e.ts).toISOString() : new Date().toISOString()
+      });
+    });
+  });
+  if (rows.length) {
+    const { error } = await supabaseClient.from('workout_entries').insert(rows);
+    if (error) throw error;
+  }
+  localStorage.setItem(key, '1');
 }
 
 /* ============================================
@@ -293,7 +358,7 @@ function refreshCard(exId) {
           <span>${formatDateFull(e.date)}</span>
           <span>${e.carga}kg × ${e.reps}</span>
         </div>
-        <button class="btn-delete" type="button" data-action="delete" data-ts="${e.ts}" aria-label="Excluir registro">
+        <button class="btn-delete" type="button" data-action="delete" data-entry-id="${e.id}" aria-label="Excluir registro">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path>
           </svg>
@@ -345,14 +410,21 @@ function attachPanelEvents() {
     if (delBtn) {
       const card = delBtn.closest('.exercise-card');
       const exId = card.dataset.exerciseId;
-      const ts = parseInt(delBtn.dataset.ts, 10);
-      deleteEntry(exId, ts);
+      const entryId = delBtn.dataset.entryId;
+      deleteEntry(exId, entryId);
       return;
     }
   });
 }
 
-function handleSave(card) {
+async function saveBtnState(card, saving) {
+  const btn = card.querySelector('[data-action="save"]');
+  if (!btn) return;
+  btn.disabled = saving;
+  btn.style.opacity = saving ? '0.6' : '';
+}
+
+async function handleSave(card) {
   const exId = card.dataset.exerciseId;
   const cargaInput = card.querySelector(`#carga-${exId}`);
   const repsInput = card.querySelector(`#reps-${exId}`);
@@ -368,8 +440,18 @@ function handleSave(card) {
     return;
   }
 
-  addEntry(exId, carga, reps);
-  refreshCard(exId);
+  try {
+    saveBtnState(card, true);
+    await addEntry(exId, carga, reps);
+    refreshCard(exId);
+  } catch (err) {
+    errorEl.textContent = 'Não foi possível salvar: ' + (err.message || 'erro desconhecido');
+    errorEl.classList.add('show');
+    setTimeout(() => errorEl.classList.remove('show'), 3500);
+    return;
+  } finally {
+    saveBtnState(card, false);
+  }
 
   const day = WORKOUTS.find(d => card.closest('.day-panel').dataset.dayPanel === d.id);
   if (day) refreshDayMeta(day);
@@ -380,6 +462,7 @@ function handleSave(card) {
 
   card.classList.add('just-saved');
   setTimeout(() => card.classList.remove('just-saved'), 900);
+  showToast('Treino salvo na nuvem ✓');
 }
 
 /* ============================================
@@ -399,11 +482,28 @@ function openEvolutionModal(exId, name) {
 
   const entries = getEntries(exId);
 
+  document.getElementById('compareSwitch').hidden = !currentFriend;
+  document.getElementById('comparisonModes').hidden = true;
+  document.getElementById('comparisonSummary').hidden = true;
+
   if (entries.length < 2) {
-    emptyMsg.hidden = false;
-    chartWrap.style.display = 'none';
-    badge.hidden = true;
-    if (currentChart) { currentChart.destroy(); currentChart = null; }
+    emptyMsg.hidden = entries.length !== 0;
+    emptyMsg.textContent = entries.length
+      ? 'Você tem apenas 1 registro deste exercício. Ainda dá para comparar com seu amigo.'
+      : 'Registre pelo menos 1 treino deste exercício para começar a acompanhar sua evolução.';
+    chartWrap.style.display = entries.length ? 'block' : 'none';
+    badge.hidden = entries.length === 0;
+
+    if (entries.length === 1) {
+      badge.classList.remove('negative');
+      badge.textContent = '1 registro';
+      renderChart(entries);
+    } else if (currentChart) {
+      currentChart.destroy();
+      currentChart = null;
+    }
+
+    document.getElementById('compareSwitch').hidden = !currentFriend;
     document.getElementById('modalClose').focus();
     return;
   }
@@ -421,6 +521,7 @@ function openEvolutionModal(exId, name) {
   badge.textContent = `${sign}${change.toFixed(1)}% de carga desde o início`;
 
   renderChart(entries);
+  document.getElementById('compareSwitch').hidden = !currentFriend;
   document.getElementById('modalClose').focus();
 }
 
@@ -502,6 +603,18 @@ function attachModalEvents() {
   document.getElementById('modalOverlay').addEventListener('click', e => {
     if (e.target.id === 'modalOverlay') closeModal();
   });
+  document.getElementById('btnCompare').addEventListener('click', async () => {
+    if (!currentExerciseId) return;
+    const card = document.querySelector(`[data-exercise-id="${currentExerciseId}"]`);
+    const name = card ? card.querySelector('.exercise-name').textContent : document.getElementById('modalTitle').textContent;
+    try { await renderComparison(currentExerciseId, name); } catch (err) { alert('Não foi possível carregar a comparação: ' + err.message); }
+  });
+  document.getElementById('compareModeEvolution').addEventListener('click', () => {
+    setComparisonMode('evolution');
+  });
+  document.getElementById('compareModeLoad').addEventListener('click', () => {
+    setComparisonMode('load');
+  });
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && !document.getElementById('modalOverlay').hidden) closeModal();
   });
@@ -517,7 +630,7 @@ function restoreLastTab() {
   }
 }
 
-function init() {
+async function init() {
   renderHomeView();
   attachHomeEvents();
   renderTabs();
@@ -525,6 +638,20 @@ function init() {
   attachTabEvents();
   attachPanelEvents();
   attachModalEvents();
+  attachAuthEvents();
+  attachFriendEvents();
+
+  const { data } = await supabaseClient.auth.getSession();
+  if (data.session) await onSignedIn(data.session);
+  else showAuth(true);
+
+  supabaseClient.auth.onAuthStateChange(async (event, session) => {
+    if (event === 'SIGNED_IN' && session) await onSignedIn(session);
+    if (event === 'SIGNED_OUT') {
+      currentUser = null; currentFriend = null; cloudLog = {};
+      showAuth(true);
+    }
+  });
 }
 
 document.addEventListener('DOMContentLoaded', init);
@@ -630,6 +757,763 @@ function attachHomeEvents() {
 
   btnHome.addEventListener('click', showHomeView);
 }
+
+/* ============================================
+   AUTENTICAÇÃO + PERFIL
+   ============================================ */
+function showAuth(forceVisible = true) {
+  const overlay = document.getElementById('authOverlay');
+  if (forceVisible) overlay.hidden = false;
+  const isSignup = authMode === 'signup';
+  document.getElementById('authTitle').textContent = isSignup ? 'Criar conta' : 'Entrar no IRON LAB';
+  document.getElementById('authSubtitle').textContent = isSignup ? 'Crie sua conta para sincronizar seus treinos.' : 'Entre para salvar seus treinos na nuvem.';
+  document.getElementById('authSubmit').textContent = isSignup ? 'Criar conta' : 'Entrar';
+  document.getElementById('authSwitch').textContent = isSignup ? 'Já tenho uma conta' : 'Ainda não tenho uma conta';
+  document.getElementById('authNameField').hidden = !isSignup;
+  document.getElementById('authUsernameField').hidden = !isSignup;
+}
+
+function hideAuth() { document.getElementById('authOverlay').hidden = true; }
+
+function showAuthError(message) {
+  const el = document.getElementById('authError');
+  el.textContent = message || '';
+  el.classList.toggle('show', !!message);
+}
+
+async function ensureProfile() {
+  const name = (document.getElementById('authName').value || '').trim();
+  const username = (document.getElementById('authUsername').value || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+  if (!currentUser) return;
+  const { data: existing, error: readError } = await supabaseClient.from('profiles').select('id, username, display_name').eq('id', currentUser.id).maybeSingle();
+  if (readError) throw readError;
+  if (existing) {
+    document.getElementById('accountName').textContent = existing.display_name || existing.username || 'Conta';
+    return existing;
+  }
+  const displayName = name || currentUser.user_metadata?.display_name || currentUser.email?.split('@')[0] || 'Usuário';
+  const finalUsername = username || ('user_' + currentUser.id.slice(0, 8));
+  const { data, error } = await supabaseClient.from('profiles').insert({ id: currentUser.id, username: finalUsername, display_name: displayName }).select().single();
+  if (error) throw error;
+  document.getElementById('accountName').textContent = data.display_name;
+  return data;
+}
+
+async function onSignedIn(session) {
+  currentUser = session.user;
+  try {
+    await migrateLocalLog();
+    await loadCloudLog();
+    await ensureProfile();
+    hideAuth();
+    document.getElementById('accountName').textContent = document.getElementById('accountName').textContent || currentUser.email;
+    renderHomeView();
+    renderPanels();
+    await loadFriendState();
+  } catch (err) {
+    console.error(err);
+    showAuthError('Não foi possível carregar sua conta: ' + friendlyError(err));
+  }
+}
+
+async function handleAuthSubmit(e) {
+  e.preventDefault();
+  showAuthError('');
+  const email = document.getElementById('authEmail').value.trim();
+  const password = document.getElementById('authPassword').value;
+  const submit = document.getElementById('authSubmit');
+  submit.disabled = true;
+  try {
+    if (authMode === 'signup') {
+      const name = document.getElementById('authName').value.trim();
+      const username = document.getElementById('authUsername').value.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+      if (!name || username.length < 3) throw new Error('Informe seu nome e um usuário com pelo menos 3 caracteres.');
+      const { data, error } = await supabaseClient.auth.signUp({ email, password, options: { data: { display_name: name, username } } });
+      if (error) throw error;
+      if (!data.session) {
+        showAuthError('Conta criada. Verifique seu e-mail para confirmar a conta e depois entre novamente.');
+      }
+    } else {
+      const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+    }
+  } catch (err) {
+    showAuthError(friendlyError(err, 'Não foi possível autenticar.'));
+  } finally { submit.disabled = false; }
+}
+
+function attachAuthEvents() {
+  document.getElementById('authForm').addEventListener('submit', handleAuthSubmit);
+  document.getElementById('authSwitch').addEventListener('click', () => {
+    authMode = authMode === 'login' ? 'signup' : 'login';
+    document.getElementById('authForm').reset();
+    showAuth(false);
+    showAuthError('');
+  });
+  document.getElementById('btnAccount').addEventListener('click', async () => {
+    await supabaseClient.auth.signOut();
+  });
+}
+
+/* ============================================
+   AMIZADES / COMPARAÇÃO
+   ============================================ */
+
+let friendshipRows = [];
+
+async function loadFriendState() {
+  if (!currentUser) return;
+
+  const { data, error } = await supabaseClient
+    .from('friendships')
+    .select('id, requester_id, addressee_id, status, created_at, updated_at')
+    .or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`)
+    .order('updated_at', { ascending: false });
+
+  if (error) {
+    console.error(error);
+    return;
+  }
+
+  friendshipRows = data || [];
+
+  const accepted = friendshipRows.find(f => f.status === 'accepted');
+  currentFriend = accepted
+    ? (accepted.requester_id === currentUser.id ? accepted.addressee_id : accepted.requester_id)
+    : null;
+
+  updateCompetitionCard(friendshipRows);
+}
+
+function updateCompetitionCard(friendships) {
+  const status = document.getElementById('competitionStatus');
+  if (!status) return;
+
+  const acceptedCount = (friendships || []).filter(f => f.status === 'accepted').length;
+  const incoming = (friendships || []).filter(
+    f => f.status === 'pending' && f.addressee_id === currentUser.id
+  ).length;
+
+  if (acceptedCount) {
+    status.textContent = acceptedCount === 1
+      ? 'Você já tem 1 amigo. Abra para ver e comparar a evolução.'
+      : `Você já tem ${acceptedCount} amigos. Escolha com quem comparar.`;
+  } else if (incoming) {
+    status.textContent = incoming === 1
+      ? 'Você recebeu 1 solicitação de amizade.'
+      : `Você recebeu ${incoming} solicitações de amizade.`;
+  } else {
+    status.textContent = 'Adicione um amigo para comparar suas evoluções.';
+  }
+}
+
+async function openFriendModal() {
+  const overlay = document.getElementById('friendModalOverlay');
+  overlay.hidden = false;
+  requestAnimationFrame(() => overlay.classList.add('open'));
+  document.getElementById('friendError').textContent = '';
+  document.getElementById('friendError').classList.remove('show');
+  document.getElementById('friendUsername').focus();
+  await renderFriendList();
+}
+
+function closeFriendModal() {
+  const overlay = document.getElementById('friendModalOverlay');
+  overlay.classList.remove('open');
+  setTimeout(() => { overlay.hidden = true; }, 220);
+}
+
+function escapeHTML(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;'
+  }[char]));
+}
+
+async function getProfilesByIds(ids) {
+  if (!ids.length) return [];
+  const { data, error } = await supabaseClient
+    .from('profiles')
+    .select('id, username, display_name')
+    .in('id', ids);
+
+  if (error) throw error;
+  return data || [];
+}
+
+async function renderFriendList() {
+  const list = document.getElementById('friendList');
+
+  const { data, error } = await supabaseClient
+    .from('friendships')
+    .select('id, requester_id, addressee_id, status, created_at, updated_at')
+    .or(`requester_id.eq.${currentUser.id},addressee_id.eq.${currentUser.id}`)
+    .order('updated_at', { ascending: false });
+
+  if (error) {
+    list.innerHTML = `<p class="friend-empty">${escapeHTML(error.message)}</p>`;
+    return;
+  }
+
+  friendshipRows = data || [];
+
+  const ids = [...new Set(
+    friendshipRows
+      .flatMap(f => [f.requester_id, f.addressee_id])
+      .filter(id => id !== currentUser.id)
+  )];
+
+  let profiles = [];
+  try {
+    profiles = await getProfilesByIds(ids);
+  } catch (err) {
+    list.innerHTML = `<p class="friend-empty">Não foi possível carregar os perfis.</p>`;
+    return;
+  }
+
+  const profileById = Object.fromEntries(profiles.map(p => [p.id, p]));
+
+  if (!friendshipRows.length) {
+    list.innerHTML = '<p class="friend-empty">Nenhuma amizade ainda. Adicione seu amigo pelo @usuário acima.</p>';
+    updateCompetitionCard(friendshipRows);
+    return;
+  }
+
+  list.innerHTML = friendshipRows.map(f => {
+    const otherId = f.requester_id === currentUser.id ? f.addressee_id : f.requester_id;
+    const profile = profileById[otherId] || {};
+    const incoming = f.addressee_id === currentUser.id && f.status === 'pending';
+    const outgoing = f.requester_id === currentUser.id && f.status === 'pending';
+
+    const displayName = escapeHTML(profile.display_name || 'Usuário');
+    const username = escapeHTML(profile.username || 'sem_usuario');
+
+    let actions = '';
+
+    if (f.status === 'accepted') {
+      actions = `
+        <button class="btn btn-competition friend-compare-btn"
+                type="button"
+                data-friend-action="compare"
+                data-user-id="${escapeHTML(otherId)}">
+          Comparar
+        </button>
+      `;
+    } else if (incoming) {
+      actions = `
+        <button class="btn btn-save" type="button"
+                data-friend-action="accept" data-id="${escapeHTML(f.id)}">Aceitar</button>
+        <button class="btn btn-delete-text" type="button"
+                data-friend-action="decline" data-id="${escapeHTML(f.id)}">Recusar</button>
+      `;
+    } else if (outgoing) {
+      actions = `
+        <span class="friend-status">Solicitação enviada</span>
+        <button class="btn btn-delete-text" type="button"
+                data-friend-action="remove" data-id="${escapeHTML(f.id)}">Cancelar</button>
+      `;
+    } else {
+      actions = `<span class="friend-status">Pendente</span>`;
+    }
+
+    return `
+      <div class="friend-row">
+        <div>
+          <strong>${displayName}</strong>
+          <span>@${username}</span>
+        </div>
+        <div class="friend-actions">${actions}</div>
+      </div>
+    `;
+  }).join('');
+
+  updateCompetitionCard(friendshipRows);
+}
+
+async function addFriend() {
+  const input = document.getElementById('friendUsername');
+  const username = input.value.trim().replace(/^@/, '').toLowerCase();
+  const err = document.getElementById('friendError');
+
+  err.textContent = '';
+  err.classList.remove('show');
+
+  if (!username) {
+    err.textContent = 'Digite o usuário do seu amigo.';
+    err.classList.add('show');
+    return;
+  }
+
+  const { data: profile, error: pErr } = await supabaseClient
+    .from('profiles')
+    .select('id, username, display_name')
+    .eq('username', username)
+    .maybeSingle();
+
+  if (pErr) {
+    err.textContent = friendlyError(pErr);
+    err.classList.add('show');
+    return;
+  }
+
+  if (!profile) {
+    err.textContent = 'Usuário não encontrado. Confira o @usuário.';
+    err.classList.add('show');
+    return;
+  }
+
+  if (profile.id === currentUser.id) {
+    err.textContent = 'Você não pode adicionar a si mesmo.';
+    err.classList.add('show');
+    return;
+  }
+
+  const existing = friendshipRows.find(f =>
+    (f.requester_id === currentUser.id && f.addressee_id === profile.id) ||
+    (f.requester_id === profile.id && f.addressee_id === currentUser.id)
+  );
+
+  if (existing) {
+    err.textContent = existing.status === 'accepted'
+      ? 'Vocês já são amigos.'
+      : existing.status === 'pending'
+        ? (existing.addressee_id === currentUser.id
+          ? 'Essa pessoa já enviou uma solicitação para você. Aceite-a abaixo.'
+          : 'Você já enviou uma solicitação para essa pessoa.')
+        : 'Já existe um registro de amizade entre vocês.';
+    err.classList.add('show');
+    return;
+  }
+
+  const button = document.getElementById('btnAddFriend');
+  button.disabled = true;
+
+  const { error } = await supabaseClient
+    .from('friendships')
+    .insert({
+      requester_id: currentUser.id,
+      addressee_id: profile.id
+    });
+
+  button.disabled = false;
+
+  if (error) {
+    err.textContent = error.code === '23505'
+      ? 'Essa amizade já existe ou já foi solicitada.'
+      : friendlyError(error, 'Não foi possível enviar a solicitação.');
+    err.classList.add('show');
+    return;
+  }
+
+  input.value = '';
+  err.textContent = 'Solicitação enviada!';
+  err.classList.add('show');
+  showToast('Solicitação de amizade enviada ✓');
+
+  await loadFriendState();
+  await renderFriendList();
+}
+
+async function handleFriendAction(action, id, userId) {
+  if (action === 'compare') {
+    currentFriend = userId;
+    closeFriendModal();
+
+    if (currentExerciseId) {
+      const card = document.querySelector(`[data-exercise-id="${currentExerciseId}"]`);
+      const name = card
+        ? card.querySelector('.exercise-name').textContent
+        : document.getElementById('modalTitle').textContent;
+
+      try {
+        await renderComparison(currentExerciseId, name);
+      } catch (err) {
+        showToast(friendlyError(err, 'Não foi possível carregar a comparação.'), 'error');
+      }
+    } else {
+      showToast('Amigo selecionado. Abra um exercício para comparar.');
+    }
+    return;
+  }
+
+  if (!id) return;
+
+  if (action === 'remove') {
+    const { error } = await supabaseClient
+      .from('friendships')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      document.getElementById('friendError').textContent = friendlyError(error);
+      document.getElementById('friendError').classList.add('show');
+      return;
+    }
+
+    await loadFriendState();
+    await renderFriendList();
+    return;
+  }
+
+  const status = action === 'accept' ? 'accepted' : 'declined';
+
+  const { error } = await supabaseClient
+    .from('friendships')
+    .update({
+      status,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', id);
+
+  if (error) {
+    document.getElementById('friendError').textContent = friendlyError(error);
+    document.getElementById('friendError').classList.add('show');
+    return;
+  }
+
+  await loadFriendState();
+  await renderFriendList();
+}
+
+function attachFriendEvents() {
+  document.getElementById('btnCompetition').addEventListener('click', openFriendModal);
+  document.getElementById('friendModalClose').addEventListener('click', closeFriendModal);
+
+  document.getElementById('friendModalOverlay').addEventListener('click', e => {
+    if (e.target.id === 'friendModalOverlay') closeFriendModal();
+  });
+
+  document.getElementById('btnAddFriend').addEventListener('click', addFriend);
+
+  document.getElementById('friendUsername').addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      addFriend();
+    }
+  });
+
+  document.getElementById('friendList').addEventListener('click', e => {
+    const btn = e.target.closest('[data-friend-action]');
+    if (!btn) return;
+
+    handleFriendAction(
+      btn.dataset.friendAction,
+      btn.dataset.id,
+      btn.dataset.userId
+    );
+  });
+}
+
+async function getFriendEntries(exId) {
+  if (!currentFriend) return [];
+
+  const { data, error } = await supabaseClient
+    .from('workout_entries')
+    .select('id, date, carga, reps, created_at')
+    .eq('user_id', currentFriend)
+    .eq('exercise_id', exId)
+    .order('date', { ascending: true })
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+
+  return (data || []).map(e => ({
+    ...e,
+    carga: Number(e.carga),
+    reps: Number(e.reps),
+    ts: new Date(e.created_at).getTime()
+  }));
+}
+
+let comparisonMode = 'evolution';
+
+function getEvolutionPercent(entries) {
+  if (!entries.length || entries[0].carga === 0) return null;
+  const first = Number(entries[0].carga);
+  return entries.map(entry => ((Number(entry.carga) - first) / first) * 100);
+}
+
+function getComparisonWinner(ownEntries, friendEntries, ownName, friendName) {
+  const ownFirst = ownEntries.length ? Number(ownEntries[0].carga) : null;
+  const ownLast = ownEntries.length ? Number(ownEntries[ownEntries.length - 1].carga) : null;
+  const friendFirst = friendEntries.length ? Number(friendEntries[0].carga) : null;
+  const friendLast = friendEntries.length ? Number(friendEntries[friendEntries.length - 1].carga) : null;
+
+  const ownPct = ownFirst && ownLast !== null ? ((ownLast - ownFirst) / ownFirst) * 100 : null;
+  const friendPct = friendFirst && friendLast !== null ? ((friendLast - friendFirst) / friendFirst) * 100 : null;
+
+  if (ownPct === null && friendPct === null) return { ownPct, friendPct, winner: null };
+  if (friendPct === null) return { ownPct, friendPct, winner: ownName };
+  if (ownPct === null) return { ownPct, friendPct, winner: friendName };
+
+  if (Math.abs(ownPct - friendPct) < 0.05) {
+    return { ownPct, friendPct, winner: 'empate' };
+  }
+
+  return {
+    ownPct,
+    friendPct,
+    winner: ownPct > friendPct ? ownName : friendName
+  };
+}
+
+function comparisonNumber(value) {
+  if (Number.isInteger(value)) return String(value);
+  return Number(value).toFixed(1).replace('.', ',');
+}
+
+function setComparisonMode(mode) {
+  comparisonMode = mode;
+
+  const loadButton = document.getElementById('compareModeLoad');
+  const evolutionButton = document.getElementById('compareModeEvolution');
+
+  if (loadButton) {
+    loadButton.classList.toggle('active', mode === 'load');
+    loadButton.setAttribute('aria-pressed', mode === 'load' ? 'true' : 'false');
+  }
+
+  if (evolutionButton) {
+    evolutionButton.classList.toggle('active', mode === 'evolution');
+    evolutionButton.setAttribute('aria-pressed', mode === 'evolution' ? 'true' : 'false');
+  }
+
+  if (currentFriend && currentExerciseId) {
+    const card = document.querySelector(`[data-exercise-id="${currentExerciseId}"]`);
+    const name = card
+      ? card.querySelector('.exercise-name')?.textContent || currentExerciseId
+      : document.getElementById('modalTitle').textContent.split(' — ')[0];
+
+    renderComparison(currentExerciseId, name);
+  }
+}
+
+function renderComparisonSummary(ownEntries, friendEntries, ownName, friendName) {
+  const result = getComparisonWinner(ownEntries, friendEntries, ownName, friendName);
+  const summary = document.getElementById('comparisonSummary');
+  if (!summary) return;
+
+  const formatPct = pct => pct === null
+    ? '—'
+    : `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%`;
+
+  let winnerText = 'Sem dados suficientes para decidir quem está na frente.';
+
+  if (result.winner === 'empate') {
+    winnerText = '🤝 Empate na evolução';
+  } else if (result.winner) {
+    winnerText = `🏆 ${result.winner} está na frente na evolução`;
+  }
+
+  summary.innerHTML = `
+    <div class="comparison-person">
+      <strong>${escapeHTML(ownName)}</strong>
+      <span class="${result.ownPct !== null && result.ownPct < 0 ? 'negative' : ''}">${formatPct(result.ownPct)}</span>
+    </div>
+    <div class="comparison-vs">VS</div>
+    <div class="comparison-person">
+      <strong>${escapeHTML(friendName)}</strong>
+      <span class="${result.friendPct !== null && result.friendPct < 0 ? 'negative' : ''}">${formatPct(result.friendPct)}</span>
+    </div>
+    <div class="comparison-winner">${escapeHTML(winnerText)}</div>
+  `;
+  summary.hidden = false;
+}
+
+async function renderComparison(exId, name) {
+  if (!currentFriend) {
+    await openFriendModal();
+    return;
+  }
+
+  const [friendEntries, ownEntries] = await Promise.all([
+    getFriendEntries(exId),
+    Promise.resolve(getEntries(exId))
+  ]);
+
+  if (!friendEntries.length && !ownEntries.length) {
+    document.getElementById('modalTitle').textContent = name + ' — batalha';
+    document.getElementById('modalBadge').hidden = true;
+    document.getElementById('modalEmpty').hidden = false;
+    document.getElementById('modalEmpty').textContent = 'Nenhum dos dois possui registros deste exercício ainda.';
+    document.getElementById('chartWrap').style.display = 'none';
+    const summary = document.getElementById('comparisonSummary');
+    if (summary) summary.hidden = true;
+    return;
+  }
+
+  const friendProfile = await supabaseClient
+    .from('profiles')
+    .select('display_name, username')
+    .eq('id', currentFriend)
+    .maybeSingle();
+
+  const friendName = friendProfile.data?.display_name ||
+    friendProfile.data?.username ||
+    'Amigo';
+
+  const ownName = document.getElementById('accountName').textContent || 'Você';
+
+  document.getElementById('modalTitle').textContent = `${name} — batalha`;
+  document.getElementById('modalBadge').hidden = true;
+  document.getElementById('comparisonModes').hidden = false;
+  document.getElementById('compareSwitch').hidden = false;
+  document.getElementById('modalEmpty').hidden = true;
+  document.getElementById('chartWrap').style.display = 'block';
+
+  renderComparisonSummary(ownEntries, friendEntries, ownName, friendName);
+
+  const ctx = document.getElementById('evolutionChart').getContext('2d');
+  if (currentChart) currentChart.destroy();
+
+  const maxLength = Math.max(ownEntries.length, friendEntries.length);
+  const labels = Array.from({ length: maxLength }, (_, index) => `Treino ${index + 1}`);
+
+  const ownLoadData = ownEntries.map(e => Number(e.carga));
+  const friendLoadData = friendEntries.map(e => Number(e.carga));
+
+  const ownEvolutionData = getEvolutionPercent(ownEntries);
+  const friendEvolutionData = getEvolutionPercent(friendEntries);
+
+  const isEvolution = comparisonMode === 'evolution';
+  const ownData = isEvolution ? (ownEvolutionData || []) : ownLoadData;
+  const friendData = isEvolution ? (friendEvolutionData || []) : friendLoadData;
+
+  const allValues = [...ownData, ...friendData].filter(v => Number.isFinite(v));
+
+  let yMin;
+  let yMax;
+
+  if (isEvolution) {
+    const minValue = allValues.length ? Math.min(...allValues) : 0;
+    const maxValue = allValues.length ? Math.max(...allValues) : 0;
+    const range = Math.max(maxValue - minValue, 10);
+    const padding = Math.max(range * 0.18, 3);
+
+    yMin = minValue >= 0
+      ? 0
+      : Math.floor((minValue - padding) / 5) * 5;
+    yMax = Math.ceil((maxValue + padding) / 5) * 5;
+
+    if (yMax <= yMin) yMax = yMin + 10;
+  } else {
+    const minValue = allValues.length ? Math.min(...allValues) : 0;
+    const maxValue = allValues.length ? Math.max(...allValues) : 0;
+    const range = Math.max(maxValue - minValue, 5);
+    const padding = Math.max(range * 0.18, 1);
+
+    yMin = Math.max(0, Math.floor((minValue - padding) / 2) * 2);
+    yMax = Math.ceil((maxValue + padding) / 2) * 2;
+
+    if (yMax <= yMin) yMax = yMin + 10;
+  }
+
+  currentChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: ownName,
+          data: ownData,
+          borderColor: '#C026D3',
+          backgroundColor: 'rgba(192,38,211,.08)',
+          borderWidth: 2.5,
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          tension: .35,
+          spanGaps: false
+        },
+        {
+          label: friendName,
+          data: friendData,
+          borderColor: '#22C55E',
+          backgroundColor: 'rgba(34,197,94,.08)',
+          borderWidth: 2.5,
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          tension: .35,
+          spanGaps: false
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: prefersReducedMotion ? false : { duration: 650, easing: 'easeOutQuart' },
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          display: true,
+          labels: {
+            color: '#F3F1F7',
+            usePointStyle: true,
+            padding: 16
+          }
+        },
+        tooltip: {
+          backgroundColor: '#1e1929',
+          borderColor: 'rgba(255,255,255,.12)',
+          borderWidth: 1,
+          padding: 10,
+          callbacks: {
+            label: item => {
+              if (item.parsed.y === null || item.parsed.y === undefined) return `${item.dataset.label}: —`;
+              return isEvolution
+                ? `${item.dataset.label}: ${item.parsed.y >= 0 ? '+' : ''}${item.parsed.y.toFixed(1)}%`
+                : `${item.dataset.label}: ${comparisonNumber(item.parsed.y)} kg`;
+            },
+            afterBody: items => {
+              const index = items[0]?.dataIndex;
+              if (index === undefined) return '';
+
+              const repsLines = [];
+              if (ownEntries[index]) repsLines.push(`${ownName}: ${ownEntries[index].reps} reps`);
+              if (friendEntries[index]) repsLines.push(`${friendName}: ${friendEntries[index].reps} reps`);
+              return repsLines;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(255,255,255,.06)' },
+          ticks: {
+            color: '#6B6479',
+            font: { family: 'Plus Jakarta Sans', size: 11 },
+            maxRotation: 0
+          },
+          title: {
+            display: true,
+            text: 'Nº do treino',
+            color: '#6B6479'
+          }
+        },
+        y: {
+          min: yMin,
+          max: yMax,
+          grid: { color: 'rgba(255,255,255,.06)' },
+          ticks: {
+            color: '#6B6479',
+            font: { family: 'Plus Jakarta Sans', size: 11 },
+            callback: value => isEvolution
+              ? `${value >= 0 ? '+' : ''}${value}%`
+              : `${value} kg`
+          },
+          title: {
+            display: true,
+            text: isEvolution ? 'Evolução (%)' : 'Carga (kg)',
+            color: '#6B6479'
+          }
+        }
+      }
+    }
+  });
+}
+
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js')
