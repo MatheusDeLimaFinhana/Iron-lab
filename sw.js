@@ -1,9 +1,10 @@
-const CACHE_NAME = 'ironlab-v2';
+const CACHE_NAME = 'ironlab-v3';
 const ASSETS = [
     './',
     './index.html',
     './style.css',
     './script.js',
+    './supabase.js',
     './manifest.json',
     './logo.png'
 ];
