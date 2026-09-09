@@ -8,7 +8,7 @@ const WORKOUTS = [
     id: 'a',
     letter: 'A',
     title: 'Peito e Ombro',
-    exercises: ['Supino inclinado', 'Supino reto', 'Cross na polia alta', 'Elevação lateral', 'Abdômen']
+    exercises: ['Supino inclinado', 'Crucifixo', 'Cross na polia alta', 'Desenvolvimento', 'Elevação lateral', 'Abdômen']
   },
   {
     id: 'b',
@@ -635,6 +635,7 @@ async function init() {
   attachHomeEvents();
   renderTabs();
   renderPanels();
+  restoreLastTab();
   attachTabEvents();
   attachPanelEvents();
   attachModalEvents();
@@ -809,6 +810,7 @@ async function onSignedIn(session) {
     document.getElementById('accountName').textContent = document.getElementById('accountName').textContent || currentUser.email;
     renderHomeView();
     renderPanels();
+    restoreLastTab();
     await loadFriendState();
   } catch (err) {
     console.error(err);
